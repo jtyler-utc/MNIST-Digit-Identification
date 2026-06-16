@@ -20,7 +20,6 @@ from torch.utils.data import DataLoader
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from models.interference_model import MNISTInterferenceTolerantCNN
 from models.jac_model import get_jac_model, JAC_MODELS
 from training.interference import apply_random_interference
 

@@ -37,7 +37,6 @@ from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtCore import Qt, QTimer
 
 from models.base_model import MNISTCNN
-from models.interference_model import MNISTInterferenceTolerantCNN
 from models.jac_model import JAC_MODELS, get_jac_model_info, JACMLP, JACLSTM, JACCNN, JACResNet, JACTransformer
 from training.standard_trainer import TrainingThread
 from training.noise_robust_trainer import NoiseRobustTrainingThread
@@ -51,7 +50,6 @@ JAC_KEYS = {'mlp', 'lstm', 'cnn', 'resnet', 'transformer'}
 # Model class mapping for loading
 MODEL_CLASS_MAP = {
     'standard': MNISTCNN,
-    'noise_robust': MNISTInterferenceTolerantCNN,
     'mlp': JACMLP,
     'lstm': JACLSTM,
     'cnn': JACCNN,
