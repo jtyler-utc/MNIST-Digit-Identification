@@ -9,7 +9,6 @@ from PyQt6.QtWidgets import QApplication
 
 from gui.main_window import MNISTApp
 
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

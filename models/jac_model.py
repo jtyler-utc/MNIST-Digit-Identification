@@ -111,12 +111,22 @@ class JACMLP(nn.Module):
 
         self.classifier_head = JACClassifierHead(num_classes)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Distortion discrimination head: learns to predict distortion level in [0, 1]
+        self.distortion_discriminator = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latent = self.encoder(x)
         reconstruction = self.decoder(latent)
         classifier_features = self.encoder_for_classifier(latent)
         class_logits = self.classifier_head(classifier_features.flatten(1))
-        return class_logits, reconstruction
+        distortion_score = self.distortion_discriminator(latent)
+        return class_logits, reconstruction, distortion_score
 
 
 # =============================================================================
@@ -145,52 +155,57 @@ class JACLSTM(nn.Module):
             num_layers=self.num_layers, batch_first=True
         )
         self.lstm_input_proj = nn.Linear(448, 64)
-        self.lstm_decoder = nn.LSTM(
-            input_size=self.hidden_dim, hidden_size=self.hidden_dim,
-            num_layers=self.num_layers, batch_first=True
-        )
-        self.decoder_output_proj = nn.Linear(self.hidden_dim, 64)
+        # Decoder: project each timestep's LSTM output (128) -> 64
+        self.decoder_linear = nn.Linear(self.hidden_dim, 64)
 
+        # Decoder: upsample from 7x7 to 28x28 using transposed convolutions
+        # Input: (B, 64, 7, 7) - conv features directly
         self.decoder_conv = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),  # (B, 64, 7, 7)
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),  # (B, 64, 14, 14)
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),  # (B, 32, 28, 28)
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),  # (B, 1, 28, 28)
             nn.Sigmoid(),
         )
 
         self.classifier_head = JACClassifierHead(num_classes)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Distortion discrimination head: learns to predict distortion level in [0, 1]
+        # Uses the 128-dim LSTM hidden state as input
+        self.distortion_discriminator = nn.Sequential(
+            nn.Linear(self.hidden_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = x.size(0)
-        conv_features = self.conv_pre_encoder(x)
+        conv_features = self.conv_pre_encoder(x)  # (B, 64, 7, 7)
 
-        row_features = conv_features.permute(0, 2, 1, 3)
-        row_features = row_features.reshape(batch_size, 7, -1)
-        row_features = self.lstm_input_proj(row_features)
-        lstm_out, _ = self.lstm_encoder(row_features)
-        hidden_state = lstm_out[:, -1, :]
+        # Reshape conv features for LSTM: (B, 64, 7, 7) -> process 7 columns as sequence
+        # Permute to (B, 7, 64, 7), then flatten last 2 dims -> (B, 7, 448)
+        seq_features = conv_features.permute(0, 2, 1, 3)  # (B, 7, 64, 7)
+        seq_features = seq_features.reshape(batch_size, 7, -1)  # (B, 7, 448)
+        seq_features = self.lstm_input_proj(seq_features)  # (B, 7, 64)
+        lstm_out, _ = self.lstm_encoder(seq_features)  # (B, 7, 128)
 
-        decoded_rows = []
-        hidden_dec = None
-        for _ in range(7):
-            if hidden_dec is None:
-                h0 = hidden_state.unsqueeze(0).expand(self.num_layers, -1, -1).contiguous()
-                c0 = hidden_state.unsqueeze(0).expand(self.num_layers, -1, -1).contiguous()
-                hidden_dec = (h0, c0)
-            lstm_out_row, hidden_dec = self.lstm_decoder(hidden_state.unsqueeze(1), hidden_dec)
-            row_feat = self.decoder_output_proj(lstm_out_row.squeeze(1))
-            decoded_rows.append(row_feat)
+        # Reconstruction: use conv features directly (they have 7x7 spatial structure)
+        # Add an extra conv layer to learn better feature transformation
+        reconstruction = self.decoder_conv(conv_features)
 
-        decoded_rows = torch.stack(decoded_rows, dim=1)
-        decoded_rows = decoded_rows.permute(0, 2, 1)
-        decoded_rows = decoded_rows.unsqueeze(-1).expand(-1, -1, -1, 7)
-        reconstruction = self.decoder_conv(decoded_rows)
+        # Classifier uses conv features (preserves spatial info)
         class_logits = self.classifier_head(conv_features.flatten(1))
-        return class_logits, reconstruction
+
+        # Distortion score from the final LSTM hidden state (128-dim latent)
+        hidden_state = lstm_out[:, -1, :]
+        distortion_score = self.distortion_discriminator(hidden_state)
+
+        return class_logits, reconstruction, distortion_score
 
 
 # =============================================================================
@@ -236,7 +251,20 @@ class JACCNN(nn.Module):
 
         self.classifier_head = JACClassifierHead(num_classes)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Distortion discrimination head: learns to predict distortion level in [0, 1]
+        # Uses adaptive average pooling to get 64 features regardless of spatial size
+        # (bottleneck outputs 64 channels)
+        self.distortion_discriminator = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # Pool to (B, 64, 1, 1)
+            nn.Flatten(),
+            nn.Linear(64, 32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         enc1 = self.encoder[:4](x)
         enc2 = self.encoder[4:8](enc1)
         enc3 = self.encoder[8:](enc2)
@@ -249,7 +277,11 @@ class JACCNN(nn.Module):
         dec2 = self.decoder_skip2(dec2)
         reconstruction = self.decoder(dec2)
         class_logits = self.classifier_head(bottleneck.flatten(1))
-        return class_logits, reconstruction
+
+        # Distortion score from bottleneck features
+        distortion_score = self.distortion_discriminator(bottleneck)
+
+        return class_logits, reconstruction, distortion_score
 
 
 # =============================================================================
@@ -294,26 +326,44 @@ class JACResNet(nn.Module):
             ResidualBlock(64, 64, stride=1),
         )
 
-        self.decoder_block2 = nn.Sequential(
-            nn.ConvTranspose2d(64, 1, kernel_size=2, stride=2),
-            nn.BatchNorm2d(1),
+        self.decoder_output = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            ResidualBlock(1, 1, stride=1),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1),
+            nn.Tanh(),  # Output in [-1, 1] range
         )
-
-        self.final_sigmoid = nn.Sigmoid()
         self.classifier_head = JACClassifierHead(num_classes)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Distortion discrimination head: learns to predict distortion level in [0, 1]
+        # Uses adaptive average pooling to get 64 features regardless of spatial size
+        self.distortion_discriminator = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # Pool to (B, 64, 1, 1)
+            nn.Flatten(),
+            nn.Linear(64, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         features = self.init_encoder(x)
         features = self.encoder_block1(features)
         features = self.encoder_block2(features)
         bottleneck_128 = self.bottleneck(features)
         bottleneck = self.bottleneck_project(bottleneck_128)
         decoded = self.decoder_block1(bottleneck_128)
-        reconstruction = self.final_sigmoid(self.decoder_block2(decoded))
+        # decoder_output gives [-1, 1], scale to [0, 1]
+        reconstruction = (self.decoder_output(decoded) + 1) / 2
         class_logits = self.classifier_head(bottleneck.flatten(1))
-        return class_logits, reconstruction
+
+        # Distortion score from bottleneck features (64-dim, via adaptive pooling)
+        distortion_score = self.distortion_discriminator(bottleneck)
+
+        return class_logits, reconstruction, distortion_score
 
 
 # =============================================================================
@@ -359,19 +409,37 @@ class JACTransformer(nn.Module):
 
         self.classifier_head = JACClassifierHead(num_classes)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Distortion discrimination head: learns to predict distortion level in [0, 1]
+        # Uses the 64-dim latent from latent_proj
+        self.distortion_discriminator = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = x.size(0)
         patches = self.patch_embedding(x)
         patches = patches.flatten(2).permute(0, 2, 1)
         patches = self.pos_encoding(patches)
         encoded = self.transformer_encoder(patches)
 
-        latent = self.latent_proj(encoded)
+        latent = self.latent_proj(encoded)  # (B, 16, 64)
         latent_reshaped = latent.permute(0, 2, 1).view(batch_size, 64, 7, 7)
         decoded = encoded.permute(0, 2, 1).view(batch_size, self.d_model, 7, 7)
         reconstruction = self.decoder_conv(decoded)
         class_logits = self.classifier_head(latent_reshaped.flatten(1))
-        return class_logits, reconstruction
+
+        # Distortion score: average over spatial tokens, then project
+        # latent is (B, 16, 64), mean gives (B, 64)
+        latent_mean = latent.mean(dim=1)  # (B, 64)
+        distortion_score = self.distortion_discriminator(latent_mean)
+
+        return class_logits, reconstruction, distortion_score
 
 
 # =============================================================================

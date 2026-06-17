@@ -1,7 +1,14 @@
-"""Noise-robust training thread for interference-tolerant model training.
+"""Distortion-agnostic noise-robust training thread for JAC models.
 
 Supports multiple encoder/decoder architectures via the JAC (Joint Autoencoder/Classifier)
-framework. The architecture is selected via the 'architecture' config parameter.
+framework with distortion-agnostic training. The architecture is selected via the 
+'architecture' config parameter.
+
+Key features:
+- Distortion discrimination head: model learns to predict distortion level [0, 1]
+- 3-way loss: classification + reconstruction + distortion matching
+- Adaptive blending: correction strength modulated by distortion score
+- Mixed clean/distorted training inputs
 """
 
 import os
@@ -21,11 +28,11 @@ from torch.utils.data import DataLoader
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from models.jac_model import get_jac_model, JAC_MODELS
-from training.interference import apply_random_interference
+from training.interference import apply_random_interference, generate_batch_interference
 
 
 class NoiseRobustTrainingThread(QThread):
-    """Background thread for interference-tolerant model training.
+    """Background thread for distortion-agnostic JAC model training.
 
     Supports multiple encoder/decoder architectures via the JAC framework.
     The architecture is selected via config['architecture'] (default: 'cnn').
@@ -59,7 +66,7 @@ class NoiseRobustTrainingThread(QThread):
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.log_signal.emit(f"Using device: {device}")
-            self.log_signal.emit("Training mode: Interference Tolerance (Encoder → Decoder → Classifier Pipeline)")
+            self.log_signal.emit("Training mode: Distortion-Agnostic JAC (Adaptive Correction Pipeline)")
 
             # Data loading (no transforms needed - interference is applied in training loop)
             test_transform = transforms.Compose([
@@ -92,9 +99,11 @@ class NoiseRobustTrainingThread(QThread):
                 # Use the original legacy model for backward compatibility
                 self.log_signal.emit(f"Initializing legacy MNISTInterferenceTolerantCNN model...")
                 model = MNISTInterferenceTolerantCNN(num_classes=10)
+                is_jac_model = False
             else:
                 self.log_signal.emit(f"Initializing JAC model with architecture: {arch_display}")
                 model = get_jac_model(self.architecture, num_classes=10)
+                is_jac_model = True
             model = model.to(device)
 
             # Count parameters
@@ -111,6 +120,22 @@ class NoiseRobustTrainingThread(QThread):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='min', factor=0.5, patience=5
             )
+
+            # Loss weights for 3-way loss
+            # λ₁ × classification_loss + λ₂ × reconstruction_loss + λ₃ × distortion_loss
+            lambda_ce = self.config.get('lambda_ce', 0.4)
+            lambda_mse = self.config.get('lambda_mse', 0.4)
+            lambda_dist = self.config.get('lambda_dist', 0.2)
+
+            # Interference generation parameters
+            # Range for training: allow some clean images (0, 0) and some highly distorted
+            train_min_noise = self.config.get('train_min_noise', 0.0)
+            train_max_noise = self.config.get('train_max_noise', 1.0)
+            train_min_blur = self.config.get('train_min_blur', 0.0)
+            train_max_blur = self.config.get('train_max_blur', 1.0)
+
+            # Validation distortion levels to test at
+            val_distortion_levels = self.config.get('val_distortion_levels', [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
 
             # Prefetch all test data to GPU
             self.log_signal.emit("Prefetching test data to GPU device...")
@@ -133,6 +158,10 @@ class NoiseRobustTrainingThread(QThread):
             verbose_freq = self.config.get('verbose_freq', 100)
             best_val_acc = 0.0
             train_losses, train_accs, val_losses, val_accs = [], [], [], []
+            
+            # Track distortion metrics
+            train_dist_errors, val_dist_errors = [], []
+            
             start_time = time.time()
             global_iteration = 0
             prev_val_loss = 0.0
@@ -143,7 +172,7 @@ class NoiseRobustTrainingThread(QThread):
             sample_idx = min(4, len(test_data_list[0]))  # Pick a sample from first test batch
             sample_original_tensor = test_data_list[0][sample_idx].to(device)  # (1, 28, 28) on GPU
             
-            # Apply fixed distortion once at the start
+            # Apply moderate distortion for visualization sample
             sample_distorted_tensor = apply_random_interference(
                 sample_original_tensor.unsqueeze(0),  # Add batch dim
                 np.array([0.5]),  # Fixed noise level
@@ -154,9 +183,11 @@ class NoiseRobustTrainingThread(QThread):
             sample_distorted = sample_distorted_tensor.cpu().numpy().squeeze()  # (28, 28) - fixed throughout training
 
             self.log_signal.emit("=" * 60)
-            self.log_signal.emit(f"Starting interference tolerance training for {num_epochs} epochs...")
+            self.log_signal.emit(f"Starting distortion-agnostic JAC training for {num_epochs} epochs...")
             self.log_signal.emit(f"Batch size: {self.config['batch_size']}, Learning rate: {self.config['learning_rate']}")
             self.log_signal.emit(f"Verbose frequency: every {verbose_freq} iterations")
+            self.log_signal.emit(f"Loss weights: CE={lambda_ce}, MSE={lambda_mse}, Distortion={lambda_dist}")
+            self.log_signal.emit(f"Training interference: noise [{train_min_noise}, {train_max_noise}], blur [{train_min_blur}, {train_max_blur}]")
             self.log_signal.emit("=" * 60)
 
             # --- Initial validation at iteration 0 (before any training) ---
@@ -164,9 +195,11 @@ class NoiseRobustTrainingThread(QThread):
             model.eval()
             val_ce_loss = 0.0
             val_mse_loss = 0.0
+            val_dist_loss = 0.0
             val_total_loss = 0.0
             correct = 0
             total = 0
+            val_dist_errors_list = []
 
             with torch.no_grad():
                 for batch_idx in range(len(test_data_list)):
@@ -178,32 +211,50 @@ class NoiseRobustTrainingThread(QThread):
                     val_noise = np.full(bsz_val, 0.5)
                     val_blur = np.full(bsz_val, 0.5)
                     distorted_val = apply_random_interference(data, val_noise, val_blur).to(device)
+                    target_distortion = 0.5 * val_noise + 0.5 * val_blur
 
-                    class_logits, reconstruction = model(distorted_val)
+                    if is_jac_model:
+                        class_logits, reconstruction, distortion_score = model(distorted_val)
+                        # Compute distortion loss
+                        distortion_score_flat = distortion_score.squeeze(-1)  # (B,)
+                        dist_loss = mse_criterion(distortion_score_flat, torch.tensor(target_distortion, dtype=torch.float32, device=device))
+                    else:
+                        class_logits, reconstruction = model(distorted_val)
+                        dist_loss = torch.tensor(0.0, device=device)
 
                     ce_loss = ce_criterion(class_logits, target)
                     mse_loss = mse_criterion(reconstruction, data)
-                    total_loss = 0.5 * ce_loss + 0.5 * mse_loss
+                    total_loss = lambda_ce * ce_loss + lambda_mse * mse_loss + lambda_dist * dist_loss
 
                     val_ce_loss += ce_loss.item()
                     val_mse_loss += mse_loss.item()
+                    val_dist_loss += dist_loss.item()
                     val_total_loss += total_loss.item()
                     _, predicted = class_logits.max(1)
                     total += target.size(0)
                     correct += predicted.eq(target).sum().item()
 
+                    # Track distortion error
+                    with torch.no_grad():
+                        dist_error = torch.abs(distortion_score.squeeze(-1) - torch.tensor(target_distortion, dtype=torch.float32, device=device)).mean().item()
+                    val_dist_errors_list.append(dist_error)
+
             val_total_loss = val_total_loss / len(test_loader)
             val_acc = 100. * correct / total
+            val_dist_error = np.mean(val_dist_errors_list) if val_dist_errors_list else 0.0
             prev_val_loss = val_total_loss
             prev_val_acc = val_acc
 
             # Emit initial validation data at iteration 0
             self.epoch_signal.emit(0, 0.0, 0.0, val_total_loss, val_acc)
-            self.log_signal.emit(f"  Iteration 0 | Initial Val Loss: {val_total_loss:.4f} Val Acc: {val_acc:.2f}%")
+            self.log_signal.emit(f"  Iteration 0 | Initial Val Loss: {val_total_loss:.4f} Val Acc: {val_acc:.2f}% Val Dist Error: {val_dist_error:.4f}")
             
             # Emit initial sample reconstruction (before any training)
             with torch.no_grad():
-                _, initial_recon = model(sample_distorted_tensor.unsqueeze(0))
+                if is_jac_model:
+                    _, initial_recon, initial_dist_score = model(sample_distorted_tensor.unsqueeze(0))
+                else:
+                    initial_recon, _ = model(sample_distorted_tensor.unsqueeze(0))
                 initial_recon_np = initial_recon.squeeze().detach().cpu().numpy().squeeze()
             self.sample_signal.emit(sample_original, sample_distorted, initial_recon_np)
 
@@ -211,6 +262,8 @@ class NoiseRobustTrainingThread(QThread):
             train_accs.append(0.0)
             val_losses.append(val_total_loss)
             val_accs.append(val_acc)
+            train_dist_errors.append(0.0)
+            val_dist_errors.append(val_dist_error)
 
             for epoch in range(1, num_epochs + 1):
                 if self._stop_requested:
@@ -223,9 +276,11 @@ class NoiseRobustTrainingThread(QThread):
                 model.train()
                 running_ce_loss = 0.0
                 running_mse_loss = 0.0
+                running_dist_loss = 0.0
                 running_total_loss = 0.0
                 correct = 0
                 total = 0
+                dist_errors_list = []
 
                 for batch_idx in range(len(train_data_list)):
                     if self._stop_requested:
@@ -236,29 +291,53 @@ class NoiseRobustTrainingThread(QThread):
                     bsz = originals.size(0)
 
                     # Generate random interference levels for this batch
-                    current_noise_levels = np.random.uniform(0, 1, bsz)
-                    current_blur_levels = np.random.uniform(0, 1, bsz)
+                    # Allows clean images (noise=0, blur=0) and distorted images
+                    current_noise_levels, current_blur_levels, current_distortion_levels = generate_batch_interference(
+                        bsz,
+                        min_noise=train_min_noise,
+                        max_noise=train_max_noise,
+                        min_blur=train_min_blur,
+                        max_blur=train_max_blur
+                    )
 
                     # Apply interference to create distorted inputs
                     distorted = apply_random_interference(originals, current_noise_levels, current_blur_levels)
                     distorted = distorted.to(device)
 
                     optimizer.zero_grad()
-                    class_logits, reconstruction = model(distorted)
+                    
+                    if is_jac_model:
+                        class_logits, reconstruction, distortion_score = model(distorted)
+                        
+                        # Compute distortion loss: match predicted score to actual distortion level
+                        distortion_score_flat = distortion_score.squeeze(-1)  # (B,)
+                        target_distortion_tensor = torch.tensor(
+                            current_distortion_levels, dtype=torch.float32, device=device
+                        )
+                        dist_loss = mse_criterion(distortion_score_flat, target_distortion_tensor)
+                    else:
+                        class_logits, reconstruction = model(distorted)
+                        dist_loss = torch.tensor(0.0, device=device)
 
                     ce_loss = ce_criterion(class_logits, target)
                     mse_loss = mse_criterion(reconstruction, originals)
-                    total_loss = 0.5 * ce_loss + 0.5 * mse_loss
+                    total_loss = lambda_ce * ce_loss + lambda_mse * mse_loss + lambda_dist * dist_loss
 
                     total_loss.backward()
                     optimizer.step()
 
                     running_ce_loss += ce_loss.item()
                     running_mse_loss += mse_loss.item()
+                    running_dist_loss += dist_loss.item()
                     running_total_loss += total_loss.item()
                     _, predicted = class_logits.max(1)
                     total += target.size(0)
                     correct += predicted.eq(target).sum().item()
+
+                    # Track distortion error
+                    if is_jac_model:
+                        dist_error = torch.abs(distortion_score_flat - target_distortion_tensor).mean().item()
+                        dist_errors_list.append(dist_error)
 
                     global_iteration += 1
 
@@ -267,58 +346,109 @@ class NoiseRobustTrainingThread(QThread):
                         iter_total_loss = running_total_loss / (batch_idx + 1)
                         iter_ce_loss = running_ce_loss / (batch_idx + 1)
                         iter_mse_loss = running_mse_loss / (batch_idx + 1)
+                        iter_dist_loss = running_dist_loss / (batch_idx + 1)
                         iter_acc = 100. * correct / total
                         log_msg = (f"  Iter {global_iteration} | Total: {iter_total_loss:.4f} | "
-                                   f"CE: {iter_ce_loss:.4f} | MSE: {iter_mse_loss:.4f} | Acc: {iter_acc:.2f}%")
+                                   f"CE: {iter_ce_loss:.4f} | MSE: {iter_mse_loss:.4f} | "
+                                   f"Dist: {iter_dist_loss:.4f} | Acc: {iter_acc:.2f}%")
                         self.log_signal.emit(log_msg)
                         self.epoch_signal.emit(global_iteration, iter_total_loss, iter_acc, prev_val_loss, prev_val_acc)
 
                         # Emit sample reconstruction for visualization at verbose intervals
                         # Original and distorted images are fixed - only reconstruction changes
                         with torch.no_grad():
-                            _, recon_sample = model(sample_distorted_tensor.unsqueeze(0))
+                            if is_jac_model:
+                                _, recon_sample, _ = model(sample_distorted_tensor.unsqueeze(0))
+                            else:
+                                recon_sample, _ = model(sample_distorted_tensor.unsqueeze(0))
                             recon_np = recon_sample.squeeze().detach().cpu().numpy().squeeze()
                         self.sample_signal.emit(sample_original, sample_distorted, recon_np)
 
                 train_total_loss = running_total_loss / len(train_loader)
                 train_ce_loss = running_ce_loss / len(train_loader)
                 train_mse_loss = running_mse_loss / len(train_loader)
+                train_dist_loss = running_dist_loss / len(train_loader)
                 train_acc = 100. * correct / total
+                train_dist_error = np.mean(dist_errors_list) if dist_errors_list else 0.0
 
-                # --- Validate ---
+                # --- Validate at multiple distortion levels ---
                 model.eval()
                 val_ce_loss = 0.0
                 val_mse_loss = 0.0
+                val_dist_loss = 0.0
                 val_total_loss = 0.0
                 correct = 0
                 total = 0
+                val_dist_errors_list = []
+
+                # Track per-level metrics for logging
+                level_metrics = {}
 
                 with torch.no_grad():
-                    for batch_idx in range(len(test_data_list)):
-                        data = test_data_list[batch_idx]
-                        target = test_labels_list[batch_idx]
+                    for val_level in val_distortion_levels:
+                        level_correct = 0
+                        level_total = 0
+                        level_ce = 0.0
+                        level_mse = 0.0
+                        level_dist = 0.0
+                        level_dist_err = []
 
-                        # Apply moderate interference for validation
-                        bsz_val = data.size(0)
-                        val_noise = np.full(bsz_val, 0.5)
-                        val_blur = np.full(bsz_val, 0.5)
-                        distorted_val = apply_random_interference(data, val_noise, val_blur).to(device)
+                        for batch_idx in range(len(test_data_list)):
+                            data = test_data_list[batch_idx]
+                            target = test_labels_list[batch_idx]
 
-                        class_logits, reconstruction = model(distorted_val)
+                            # Apply distortion at specific level for validation
+                            bsz_val = data.size(0)
+                            val_noise = np.full(bsz_val, val_level)
+                            val_blur = np.full(bsz_val, val_level)
+                            distorted_val = apply_random_interference(data, val_noise, val_blur).to(device)
+                            target_distortion = np.full(bsz_val, val_level)
 
-                        ce_loss = ce_criterion(class_logits, target)
-                        mse_loss = mse_criterion(reconstruction, data)
-                        total_loss = 0.5 * ce_loss + 0.5 * mse_loss
+                            if is_jac_model:
+                                class_logits, reconstruction, distortion_score = model(distorted_val)
+                                distortion_score_flat = distortion_score.squeeze(-1)
+                                dist_loss_batch = mse_criterion(
+                                    distortion_score_flat, 
+                                    torch.tensor(target_distortion, dtype=torch.float32, device=device)
+                                )
+                            else:
+                                class_logits, reconstruction = model(distorted_val)
+                                dist_loss_batch = torch.tensor(0.0, device=device)
 
-                        val_ce_loss += ce_loss.item()
-                        val_mse_loss += mse_loss.item()
-                        val_total_loss += total_loss.item()
-                        _, predicted = class_logits.max(1)
-                        total += target.size(0)
-                        correct += predicted.eq(target).sum().item()
+                            ce_loss = ce_criterion(class_logits, target)
+                            mse_loss = mse_criterion(reconstruction, data)
+                            total_loss = lambda_ce * ce_loss + lambda_mse * mse_loss + lambda_dist * dist_loss_batch
 
-                val_total_loss = val_total_loss / len(test_loader)
+                            level_ce += ce_loss.item()
+                            level_mse += mse_loss.item()
+                            level_dist += dist_loss_batch.item()
+                            _, predicted = class_logits.max(1)
+                            level_total += target.size(0)
+                            level_correct += predicted.eq(target).sum().item()
+
+                            if is_jac_model:
+                                dist_error = torch.abs(distortion_score_flat - torch.tensor(target_distortion, dtype=torch.float32, device=device)).mean().item()
+                                level_dist_err.append(dist_error)
+
+                        level_acc = 100. * level_correct / level_total if level_total > 0 else 0.0
+                        level_metrics[val_level] = {
+                            'acc': level_acc,
+                            'ce': level_ce / len(test_loader),
+                            'mse': level_mse / len(test_loader),
+                            'dist_err': np.mean(level_dist_err) if level_dist_err else 0.0
+                        }
+
+                        val_ce_loss += level_ce
+                        val_mse_loss += level_mse
+                        val_dist_loss += level_dist
+                        val_total_loss += (lambda_ce * level_ce + lambda_mse * level_mse + lambda_dist * level_dist)
+                        correct += level_correct
+                        total += level_total
+                        val_dist_errors_list.extend(level_dist_err)
+
+                val_total_loss = val_total_loss / len(val_distortion_levels)
                 val_acc = 100. * correct / total
+                val_dist_error = np.mean(val_dist_errors_list) if val_dist_errors_list else 0.0
                 elapsed = time.time() - epoch_start
                 current_lr = optimizer.param_groups[0]['lr']
 
@@ -326,22 +456,30 @@ class NoiseRobustTrainingThread(QThread):
                 train_accs.append(train_acc)
                 val_losses.append(val_total_loss)
                 val_accs.append(val_acc)
+                train_dist_errors.append(train_dist_error)
+                val_dist_errors.append(val_dist_error)
 
                 if global_iteration % verbose_freq == 0:
                     self.epoch_signal.emit(global_iteration, train_total_loss, train_acc, val_total_loss, val_acc)
 
                     # Emit sample reconstruction for visualization (synced with epoch_signal updates)
-                    # Original and distorted are fixed - only reconstruction changes as decoder improves
                     with torch.no_grad():
-                        _, recon_sample = model(sample_distorted_tensor.unsqueeze(0))
+                        if is_jac_model:
+                            _, recon_sample, _ = model(sample_distorted_tensor.unsqueeze(0))
+                        else:
+                            recon_sample, _ = model(sample_distorted_tensor.unsqueeze(0))
                         recon_np = recon_sample.squeeze().detach().cpu().numpy().squeeze()
                     self.sample_signal.emit(sample_original, sample_distorted, recon_np)
 
+                    # Log per-level metrics
+                    level_log = " | ".join([f"L{lv:.1f}:{m['acc']:.1f}%" for lv, m in level_metrics.items()])
+                    
                     log_msg = (f"Epoch {epoch}/{num_epochs} | "
-                               f"Train Loss: {train_total_loss:.4f} (CE: {train_ce_loss:.4f}, MSE: {train_mse_loss:.4f}) Acc: {train_acc:.2f}% | "
-                               f"Val Loss: {val_total_loss:.4f} Acc: {val_acc:.2f}% | "
+                               f"Train Loss: {train_total_loss:.4f} (CE: {train_ce_loss:.4f}, MSE: {train_mse_loss:.4f}, Dist: {train_dist_loss:.4f}) Acc: {train_acc:.2f}% | "
+                               f"Val Loss: {val_total_loss:.4f} Acc: {val_acc:.2f}% DistErr: {val_dist_error:.4f} | "
                                f"LR: {current_lr:.6f} | Time: {elapsed:.1f}s")
                     self.log_signal.emit(log_msg)
+                    self.log_signal.emit(f"  Per-level: {level_log}")
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -361,7 +499,7 @@ class NoiseRobustTrainingThread(QThread):
             # Create architecture-based subfolder
             if architecture == 'legacy':
                 # Legacy model uses old naming for backward compatibility
-                arch_folder = "legacy_noise_robust"
+                arch_folder = "noise_robust_legacy"
                 model_filename = "best_mnist_noise_robust.pth"
             else:
                 # JAC model uses architecture-specific naming
@@ -383,9 +521,12 @@ class NoiseRobustTrainingThread(QThread):
                 'train_accs': train_accs,
                 'val_losses': val_losses,
                 'val_accs': val_accs,
+                'train_dist_errors': train_dist_errors,
+                'val_dist_errors': val_dist_errors,
                 'architecture': architecture,
                 'is_noise_robust': True,
                 'model_type': 'jac' if architecture != 'legacy' else 'noise_robust',
+                'loss_weights': {'lambda_ce': lambda_ce, 'lambda_mse': lambda_mse, 'lambda_dist': lambda_dist},
             }, model_path)
             self.log_signal.emit(f"Model saved to: {model_path}")
 
@@ -396,8 +537,12 @@ class NoiseRobustTrainingThread(QThread):
                 'history': {
                     'train_losses': train_losses, 'train_accs': train_accs,
                     'val_losses': val_losses, 'val_accs': val_accs,
+                    'train_dist_errors': train_dist_errors,
+                    'val_dist_errors': val_dist_errors,
                 },
-                'is_noise_robust': True
+                'is_noise_robust': True,
+                'is_jac_model': is_jac_model,
+                'loss_weights': {'lambda_ce': lambda_ce, 'lambda_mse': lambda_mse, 'lambda_dist': lambda_dist},
             })
 
         except Exception as e:

@@ -120,6 +120,113 @@ class ReconstructionChart(FigureCanvas):
         self.fig.canvas.draw()
 
 
+class InterferencePlot(FigureCanvas):
+    """Matplotlib plot showing JAC's interference/quality estimation."""
+
+    def __init__(self, width=3, height=3, dpi=100):
+        self.dpi = dpi
+        self.fig, self.ax = plt.subplots(figsize=(width, height), dpi=dpi, constrained_layout=True)
+        self.fig.set_facecolor(DARK_BG)
+        self.ax.set_facecolor(DARK_CHARTBG)
+        super().__init__(self.fig)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.draw_empty()
+
+    def resizeEvent(self, event):
+        """Redraw the chart when the widget is resized."""
+        super().resizeEvent(event)
+        size = event.size()
+        if size.width() > 0 and size.height() > 0:
+            self.fig.set_size_inches(size.width() / self.dpi, size.height() / self.dpi)
+            self.fig.canvas.draw_idle()
+
+    def draw_empty(self):
+        self.ax.clear()
+        self.ax.set_facecolor(DARK_CHARTBG)
+        self.fig.set_facecolor(DARK_BG)
+        self.ax.set_title('Interference Estimation', color=WHITE_TEXT, fontsize=12, fontweight='bold')
+        self.ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=self.ax.transAxes,
+                     color=WHITE_TEXT, alpha=0.5)
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 1)
+        self.ax.axis('off')
+        self.fig.canvas.draw()
+
+    def update_interference(self, interference_score: float):
+        """Update the plot with interference estimation.
+
+        Args:
+            interference_score: Float in [0, 1] where 0 = clean, 1 = highly distorted.
+        """
+        self.ax.clear()
+        self.ax.set_facecolor(DARK_CHARTBG)
+        self.fig.set_facecolor(DARK_BG)
+
+        # Clamp score to [0, 1]
+        score = max(0.0, min(1.0, interference_score))
+
+        # Color gradient: green (clean) -> yellow (medium) -> red (distorted)
+        if score < 0.5:
+            bar_color = ACCENT_GREEN  # Green for low interference
+            label = 'Clean'
+        elif score < 0.7:
+            # Yellow-green
+            bar_color = '#aaff00'
+            label = 'Low Interference'
+        elif score < 0.85:
+            bar_color = ACCENT_YELLOW  # Yellow for medium interference
+            label = 'Medium Interference'
+        else:
+            bar_color = ACCENT_RED  # Red for high interference
+            label = 'High Interference'
+
+        # Draw horizontal bar
+        bar_height = 0.15
+        bar_y = 0.45
+        bar_x = 0.1
+        bar_width = 0.8
+
+        # Background track
+        self.ax.barh(bar_y, bar_width, height=bar_height, left=bar_x,
+                     color=(0.3, 0.3, 0.3, 0.3), edgecolor='white', linewidth=1, alpha=0.5)
+
+        # Filled portion
+        fill_width = bar_width * score
+        if fill_width > 0:
+            self.ax.barh(bar_y, fill_width, height=bar_height, left=bar_x,
+                         color=bar_color, edgecolor='white', linewidth=1, alpha=0.8)
+
+        # Score marker
+        marker_x = bar_x + fill_width
+        self.ax.plot(marker_x, bar_y, 'o', color='white', markersize=10, zorder=5)
+
+        # Labels
+        self.ax.set_title('Interference Estimation', color=WHITE_TEXT, fontsize=12, fontweight='bold')
+
+        # Score text
+        score_text = f'{score:.2f}'
+        self.ax.text(0.5, 0.85, f'Score: {score_text}', ha='center', va='top',
+                     transform=self.ax.transAxes, color=WHITE_TEXT, fontsize=11, fontweight='bold')
+
+        # Level text
+        self.ax.text(0.5, 0.72, label, ha='center', va='top',
+                     transform=self.ax.transAxes, color=bar_color, fontsize=10, fontweight='bold')
+
+        # Tick labels
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 1)
+        self.ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+        self.ax.set_xticklabels(['0.00', '0.25', '0.50', '0.75', '1.00'], color=WHITE_TEXT, fontsize=8)
+        self.ax.set_xlabel('Interference Level', color=WHITE_TEXT, fontsize=9)
+        self.ax.set_yticks([])
+        for label in self.ax.get_xticklabels():
+            label.set_color(WHITE_TEXT)
+        for spine in self.ax.spines.values():
+            spine.set_color(WHITE_SEMI)
+
+        self.fig.canvas.draw()
+
+
 class TrainingChart(FigureCanvas):
     """Matplotlib chart showing training progress."""
 

@@ -26,9 +26,9 @@ class DrawingCanvas(QWidget):
         self.setMinimumSize(self.size + 10, self.size + 10)
         self.setMaximumSize(self.size + 10, self.size + 10)
 
-        # Distortion parameters
-        self.blur_level = 0
-        self.noise_level = 0
+        # Distortion parameters (continuous values [0, 1] to match training)
+        self.blur_level = 0.0
+        self.noise_level = 0.0
 
     def clear(self):
         self.drawing_image.fill(self.background_color.rgb())
@@ -63,13 +63,13 @@ class DrawingCanvas(QWidget):
             self.drawing = False
             self.last_point = None
 
-    def set_blur_level(self, level: int):
-        """Set the Gaussian blur level (0-10)."""
-        self.blur_level = level
+    def set_blur_level(self, level: float):
+        """Set the Gaussian blur level (0.0-1.0, matches training)."""
+        self.blur_level = max(0.0, min(1.0, level))
 
-    def set_noise_level(self, level: int):
-        """Set the Gaussian noise level (0-10)."""
-        self.noise_level = level
+    def set_noise_level(self, level: float):
+        """Set the Gaussian noise level (0.0-1.0, matches training)."""
+        self.noise_level = max(0.0, min(1.0, level))
 
     def _apply_distortions(self, array: np.ndarray) -> np.ndarray:
         """Apply Gaussian blur and noise to a 2D numpy array (0-255 uint8).
@@ -81,12 +81,12 @@ class DrawingCanvas(QWidget):
 
         # Apply Gaussian blur if blur_level > 0
         if self.blur_level > 0:
-            sigma = self.blur_level / 3.0
+            sigma = self.blur_level * 3.0  # Matches training: sigma in [0, 3]
             result = gaussian_filter(result, sigma=sigma)
 
         # Apply Gaussian noise if noise_level > 0
         if self.noise_level > 0:
-            noise_std = self.noise_level / 25.0 * 255.0
+            noise_std = self.noise_level * 64.0  # Matches training: std in [0, 64]
             noise = np.random.normal(0, noise_std, result.shape)
             result = result + noise
 
@@ -160,4 +160,38 @@ class DrawingCanvas(QWidget):
         tensor = torch.tensor(array, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
         # Normalize with MNIST stats
         tensor = (tensor - 0.1307) / 0.3081
+        return tensor
+
+    def get_unnormalized_image(self) -> torch.Tensor:
+        """Return an unnormalized tensor for JAC model input ([0,1] range).
+
+        JAC autoencoder models expect input in [0, 1] range because they
+        learn to reconstruct clean images in that range. Using normalized
+        input causes the decoder to output incorrect values.
+        """
+        # Scale to 28x28 keeping aspect ratio
+        scaled = self.drawing_image.scaled(
+            self.image_size, self.image_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        # Create a 28x28 white canvas (MNIST has white digits on black, we invert: black background, white digits)
+        canvas = QImage(self.image_size, self.image_size, QImage.Format.Format_Grayscale8)
+        canvas.fill(255)  # Start with white background
+        x_offset = (self.image_size - scaled.width()) // 2
+        y_offset = (self.image_size - scaled.height()) // 2
+        painter = QPainter(canvas)
+        painter.drawImage(x_offset, y_offset, scaled)
+        painter.end()
+
+        # Convert to tensor
+        num_pixels = canvas.width() * canvas.height()
+        buffer = canvas.bits().asarray(num_pixels)
+        array = np.frombuffer(buffer, dtype=np.uint8).reshape(self.image_size, self.image_size)
+
+        # Apply distortions (blur + noise)
+        array = self._apply_distortions(array)
+
+        # Return as [0, 1] float tensor without normalization
+        tensor = torch.tensor(array, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
         return tensor

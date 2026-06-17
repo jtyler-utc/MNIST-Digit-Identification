@@ -41,7 +41,7 @@ from models.jac_model import JAC_MODELS, get_jac_model_info, JACMLP, JACLSTM, JA
 from training.standard_trainer import TrainingThread
 from training.noise_robust_trainer import NoiseRobustTrainingThread
 from gui.canvas import DrawingCanvas
-from gui.charts import ConfidenceChart, ReconstructionChart, TrainingChart
+from gui.charts import ConfidenceChart, ReconstructionChart, TrainingChart, InterferencePlot
 from gui.terminal import TerminalWidget, TerminalStream
 
 # JAC architecture keys (for checking if a model is JAC-based)
@@ -105,7 +105,7 @@ class MNISTApp(QMainWindow):
 
         # --- Tab 2: Classification ---
         self.classification_tab = self._build_classification_tab()
-        self.tabs.addTab(self.classification_tab, "Classification")
+        self.tabs.addTab(self.classification_tab, "Canvas")
 
         # --- Tab 3: Terminal ---
         self.terminal = TerminalWidget()
@@ -305,6 +305,7 @@ class MNISTApp(QMainWindow):
         # Left: Drawing canvas + controls
         left_layout = QVBoxLayout()
         self.canvas = DrawingCanvas()
+        self.canvas.setMaximumSize(400, 400)  # Prevent canvas from growing too large
         left_layout.addWidget(self.canvas)
 
         # Model loading controls
@@ -347,11 +348,11 @@ class MNISTApp(QMainWindow):
         distortion_group = QGroupBox("Distortions")
         distortion_layout = QVBoxLayout()
 
-        # Gaussian blur slider
+        # Gaussian blur slider (0-100 maps to 0.0-1.0 to match training)
         blur_layout = QHBoxLayout()
         blur_layout.addWidget(QLabel("Gaussian Blur:"))
         self.blur_slider = QSlider(Qt.Orientation.Horizontal)
-        self.blur_slider.setRange(0, 10)
+        self.blur_slider.setRange(0, 100)
         self.blur_slider.setValue(0)
         self.blur_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.blur_slider.setTickInterval(1)
@@ -360,11 +361,11 @@ class MNISTApp(QMainWindow):
         blur_layout.addWidget(self.blur_label)
         distortion_layout.addLayout(blur_layout)
 
-        # Noise slider
+        # Noise slider (0-100 maps to 0.0-1.0 to match training)
         noise_layout = QHBoxLayout()
         noise_layout.addWidget(QLabel("Noise:"))
         self.noise_slider = QSlider(Qt.Orientation.Horizontal)
-        self.noise_slider.setRange(0, 10)
+        self.noise_slider.setRange(0, 100)
         self.noise_slider.setValue(0)
         self.noise_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.noise_slider.setTickInterval(1)
@@ -407,32 +408,41 @@ class MNISTApp(QMainWindow):
         self.distorted_image_label = QLabel()
         self.distorted_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.distorted_image_label.setStyleSheet(
-            "background-color: white; border: 2px solid #cccccc; border-radius: 5px;"
+            "background-color: transparent; border: none;"
         )
         self.distorted_image_label.setMinimumSize(150, 150)
         self.distorted_image_label.setMaximumSize(400, 400)
         self.distorted_image_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum
         )
         self.distorted_image_container.addWidget(self.distorted_image_label)
         self.distorted_image_label.setVisible(False)  # Hidden until model loaded
-        self.bottom_layout.addLayout(self.distorted_image_container)
+        # Don't add to layout yet - will be added when model is loaded
+
+        # Interference estimation plot (only for JAC models) - placed left of reconstruction
+        self.interference_plot = InterferencePlot(width=3, height=3, dpi=100)
+        self.interference_plot.setMinimumSize(150, 150)
+        self.interference_plot.setMaximumSize(400, 400)
+        self.interference_plot.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum
+        )
+        # Don't add to layout yet - will be added when JAC model is loaded
 
         # Reconstruction image preview (only for JAC models)
         self.reconstruction_image_container = QVBoxLayout()
         self.reconstruction_image_label = QLabel()
         self.reconstruction_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.reconstruction_image_label.setStyleSheet(
-            "background-color: white; border: 2px solid #cccccc; border-radius: 5px;"
+            "background-color: transparent; border: none;"
         )
         self.reconstruction_image_label.setMinimumSize(150, 150)
         self.reconstruction_image_label.setMaximumSize(400, 400)
         self.reconstruction_image_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum
         )
         self.reconstruction_image_container.addWidget(self.reconstruction_image_label)
         self.reconstruction_image_label.setVisible(False)  # Hidden until JAC model loaded
-        self.bottom_layout.addLayout(self.reconstruction_image_container)
+        # Don't add to layout yet - will be added when JAC model is loaded
 
         layout.addWidget(self.bottom_image_panel, stretch=1)
 
@@ -656,7 +666,7 @@ class MNISTApp(QMainWindow):
         try:
             self._on_log(f"Attempting to load model from: {model_path}")
             self._on_log("Loading checkpoint...")
-            checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             self._on_log(f"Checkpoint keys: {list(checkpoint.keys())}")
             self._on_log(f"Checkpoint val_acc: {checkpoint.get('val_acc', 'N/A')}")
 
@@ -683,23 +693,29 @@ class MNISTApp(QMainWindow):
             with torch.no_grad():
                 dummy = torch.randn(1, 1, 28, 28).to(device)
                 if self.is_noise_robust_model or self._is_jac_model(architecture):
-                    test_output, test_recon = self.trained_model(dummy)
-                    self._on_log(f"Test output shape: {test_output.shape}, Reconstruction shape: {test_recon.shape}")
+                    test_output = self.trained_model(dummy)
+                    if len(test_output) == 3:
+                        # New 3-output format: (class_logits, reconstruction, quality_score)
+                        self._on_log(f"Test output shapes: logits={test_output[0].shape}, recon={test_output[1].shape}, quality={test_output[2].shape}")
+                    else:
+                        # Legacy 2-output format: (class_logits, reconstruction)
+                        self._on_log(f"Test output shapes: logits={test_output[0].shape}, recon={test_output[1].shape}")
                 else:
                     test_output = self.trained_model(dummy)
                     self._on_log(f"Test output shape: {test_output.shape}")
 
             # Update UI based on model type
             if self.is_noise_robust_model or self._is_jac_model(architecture):
-                self.load_model_btn.setText(f"{display_name} \u2713")
+                self.load_model_btn.setText("Load")
                 self.model_status_label.setText(f"Acc: {checkpoint['val_acc']:.1f}% | +Decoder")
                 self.model_status_label.setStyleSheet("color: darkblue; font-weight: bold;")
-                # Show both image previews for noise-robust/JAC model
+                # Show both image previews and interference plot for noise-robust/JAC model
                 self.distorted_image_label.setVisible(True)
                 self.reconstruction_image_label.setVisible(True)
+                self.interference_plot.setVisible(True)
                 self._on_log(f"{display_name} loaded - reconstruction output enabled")
             else:
-                self.load_model_btn.setText(f"{display_name} \u2713")
+                self.load_model_btn.setText("Load")
                 self.model_status_label.setText(f"Acc: {checkpoint['val_acc']:.1f}%")
                 self.model_status_label.setStyleSheet("color: green; font-weight: bold;")
                 # Show only distorted image for standard model
@@ -720,11 +736,6 @@ class MNISTApp(QMainWindow):
             self._update_bottom_layout_for_model_type()
 
             self._on_log(f"Model loaded successfully! Validation Acc: {checkpoint['val_acc']:.2f}%")
-            QMessageBox.information(
-                self, "Model Loaded",
-                f"Model loaded successfully!\nModel: {display_name}\nValidation Accuracy: {checkpoint['val_acc']:.2f}%\nDevice: {device}" +
-                (f"\n\nThis is a noise-robust model with reconstruction capability." if self.is_noise_robust_model else "")
-            )
 
         except Exception as e:
             import traceback
@@ -934,7 +945,7 @@ class MNISTApp(QMainWindow):
 
         # Update classification tab status
         if self.is_noise_robust_model:
-            self.load_model_btn.setText("Noise-Robust Model \u2713")
+            self.load_model_btn.setText("Load")
             self.model_status_label.setText(f"From Training: {result['best_val_acc']:.1f}% | +Decoder")
             self.model_status_label.setStyleSheet("color: darkblue; font-weight: bold;")
             # Show both image previews for noise-robust model
@@ -942,7 +953,7 @@ class MNISTApp(QMainWindow):
             self.reconstruction_image_label.setVisible(True)
             self._on_log("Noise-robust model from training - reconstruction output enabled")
         else:
-            self.load_model_btn.setText("Model Ready \u2713")
+            self.load_model_btn.setText("Load")
             self.model_status_label.setText(f"From Training: {result['best_val_acc']:.1f}%")
             self.model_status_label.setStyleSheet("color: green; font-weight: bold;")
             # Show only distorted image for standard model
@@ -990,60 +1001,129 @@ class MNISTApp(QMainWindow):
         self.update()
 
     def _on_blur_changed(self, value: int):
-        """Handle blur slider value changes."""
-        self.blur_label.setText(str(value))
-        self.canvas.set_blur_level(value)
+        """Handle blur slider value changes. Maps 0-100 to 0.0-1.0 to match training."""
+        continuous_level = value / 100.0
+        self.blur_label.setText(f"{continuous_level:.2f}")
+        self.canvas.set_blur_level(continuous_level)
 
     def _on_noise_changed(self, value: int):
-        """Handle noise slider value changes."""
-        self.noise_label.setText(str(value))
-        self.canvas.set_noise_level(value)
+        """Handle noise slider value changes. Maps 0-100 to 0.0-1.0 to match training."""
+        continuous_level = value / 100.0
+        self.noise_label.setText(f"{continuous_level:.2f}")
+        self.canvas.set_noise_level(continuous_level)
 
     def _update_bottom_layout_for_model_type(self):
         """Update the bottom layout to match the current model type.
 
-        - Standard model: distorted image centered at bottom
-        - JAC/noise-robust model: distorted and reconstructed side-by-side at bottom
+        Dynamically adds/removes widgets from the layout:
+        - Standard model: only distorted image, centered
+        - JAC/noise-robust model: distorted | interference | reconstruction side-by-side
         """
-        # Clear existing stretch/spacer items
-        while self.bottom_layout.count() > 2:
+        is_jac = self.is_noise_robust_model or self._is_jac_model(self.current_model_architecture)
+
+        # Clear all existing widgets from bottom layout, but DON'T delete the containers
+        # because they are member variables we reuse
+        while self.bottom_layout.count() > 0:
             item = self.bottom_layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
-            elif item.layout():
-                # Remove spacer widgets from layouts
-                pass
+            if item is not None:
+                widget = item.widget()
+                if widget is not None:
+                    # Don't delete our container widgets - just remove from layout
+                    if widget == self.interference_plot:
+                        widget.setVisible(False)
+                    elif widget.parent() != self.distorted_image_container and widget.parent() != self.reconstruction_image_container:
+                        widget.deleteLater()
+                # If it's a nested layout (our containers), just leave it - we reuse them
 
-        if self.is_noise_robust_model or self._is_jac_model(self.current_model_architecture):
-            # Side-by-side layout: distorted | reconstructed
-            # Both images get equal stretch
-            self.distorted_image_container.addWidget(
-                QLabel("<b>Distorted Input</b>"), stretch=0
-            )
-            self.reconstruction_image_container.addWidget(
-                QLabel("<b>Reconstructed Output</b>"), stretch=0
-            )
-            # Set stretch factors for side-by-side
-            self.bottom_layout.setStretch(0, 1)
-            self.bottom_layout.setStretch(1, 1)
+        # Clear any labels we added to containers (but keep the image labels)
+        for i in range(self.distorted_image_container.count() - 1, -1, -1):
+            item = self.distorted_image_container.itemAt(i)
+            if item is not None:
+                widget = item.widget()
+                if widget is not None and widget != self.distorted_image_label:
+                    self.distorted_image_container.removeWidget(widget)
+                    widget.deleteLater()
+
+        for i in range(self.reconstruction_image_container.count() - 1, -1, -1):
+            item = self.reconstruction_image_container.itemAt(i)
+            if item is not None:
+                widget = item.widget()
+                if widget is not None and widget != self.reconstruction_image_label:
+                    self.reconstruction_image_container.removeWidget(widget)
+                    widget.deleteLater()
+
+        if is_jac:
+            # JAC model: all three panels visible with equal stretch
+            # Add labels to containers with centered alignment
+            label_distorted = QLabel("<b>Distorted Input</b>")
+            label_distorted.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.distorted_image_container.insertWidget(0, label_distorted, stretch=0)
+            self.distorted_image_label.setVisible(True)
+
+            label_recon = QLabel("<b>Reconstructed Output</b>")
+            label_recon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.reconstruction_image_container.insertWidget(0, label_recon, stretch=0)
+            self.reconstruction_image_label.setVisible(True)
+
+            # Show interference plot
+            self.interference_plot.setVisible(True)
+
+            # Ensure containers are in the layout
+            # Check if containers are already in layout
+            has_distorted = False
+            has_interference = False
+            has_reconstruction = False
+
+            for i in range(self.bottom_layout.count()):
+                item = self.bottom_layout.itemAt(i)
+                if item is not None:
+                    w = item.widget()
+                    if w is self.distorted_image_container or (w is not None and w.layout() == self.distorted_image_container):
+                        has_distorted = True
+                    elif w is self.interference_plot:
+                        has_interference = True
+                    elif w is self.reconstruction_image_container or (w is not None and w.layout() == self.reconstruction_image_container):
+                        has_reconstruction = True
+
+            if not has_distorted:
+                self.bottom_layout.addLayout(self.distorted_image_container)
+            if not has_interference:
+                self.bottom_layout.addWidget(self.interference_plot)
+            if not has_reconstruction:
+                self.bottom_layout.addLayout(self.reconstruction_image_container)
+
+            # Count items and set stretches
+            count = self.bottom_layout.count()
+            if count == 3:
+                self.bottom_layout.setStretch(0, 1)
+                self.bottom_layout.setStretch(1, 1)
+                self.bottom_layout.setStretch(2, 1)
+
         else:
-            # Standard model: single distorted image centered
-            # Add spacer before to center it
-            if self.bottom_layout.count() == 1:
-                spacer = QWidget()
-                spacer.setMaximumWidth(0)
-                spacer.setMaximumHeight(0)
-                self.bottom_layout.insertWidget(0, spacer)
-            self.bottom_layout.setStretch(0, 1)
-            if self.bottom_layout.count() > 1:
-                self.bottom_layout.setStretch(1, 2)
+            # Standard model: only distorted image, centered
+            self.distorted_image_label.setVisible(True)
+            self.interference_plot.setVisible(False)
+            self.reconstruction_image_label.setVisible(False)
 
-        self.bottom_image_panel.layout().setAlignment(
-            self.distorted_image_container, Qt.AlignmentFlag.AlignCenter
-        )
-        self.bottom_image_panel.layout().setAlignment(
-            self.reconstruction_image_container, Qt.AlignmentFlag.AlignCenter
-        )
+            # Check if distorted container is already in layout
+            has_distorted = False
+            for i in range(self.bottom_layout.count()):
+                item = self.bottom_layout.itemAt(i)
+                if item is not None:
+                    w = item.widget()
+                    if w is self.distorted_image_container or (w is not None and w.layout() == self.distorted_image_container):
+                        has_distorted = True
+                        break
+
+            if not has_distorted:
+                self.bottom_layout.addLayout(self.distorted_image_container)
+
+        # Force full layout update
+        self.bottom_image_panel.updateGeometry()
+        self.bottom_image_panel.layout().activate()
+        self.bottom_image_panel.repaint()
+        self.updateGeometry()
+        self.repaint()
 
     def _update_distortion_preview(self):
         """Update the distorted image label with the current distorted image."""
@@ -1131,13 +1211,36 @@ class MNISTApp(QMainWindow):
                 image_tensor = image_tensor.to(self.model_device)
 
                 if self.is_noise_robust_model or self._is_jac_model(self.current_model_architecture):
-                    # JAC/noise-robust model: get both classification and reconstruction
-                    output, reconstruction = self.trained_model(image_tensor)
+                    # JAC/noise-robust model: get classification, reconstruction, and optional quality score
+                    # For JAC models, use unnormalized input ([0,1] range) so decoder can reconstruct properly
+                    if self._is_jac_model(self.current_model_architecture):
+                        # Get unnormalized tensor for reconstruction
+                        unnormalized_tensor = self.canvas.get_unnormalized_image()
+                        unnormalized_tensor = unnormalized_tensor.to(self.model_device)
+                        model_output = self.trained_model(unnormalized_tensor)
+                    else:
+                        model_output = self.trained_model(image_tensor)
+                    if len(model_output) == 3:
+                        # New 3-output format: (class_logits, reconstruction, quality_score)
+                        output, reconstruction, quality_score = model_output
+                    # quality_score: 0 = distorted, 1 = clean
+                        # distortion_score: 0 = clean, 1 = highly distorted (interference level)
+                        distortion_score_val = quality_score.squeeze().item() if quality_score.numel() == 1 else 0.0
+                        self._last_quality_score = quality_score.squeeze().item() if quality_score.numel() == 1 else 1.0
+                    else:
+                        # Legacy 2-output format: (class_logits, reconstruction)
+                        output, reconstruction = model_output
+                        distortion_score_val = 0.0  # Default: assume clean if no distortion score
+                        self._last_quality_score = 1.0  # Default: assume clean if no quality score
+
                     recon_np = reconstruction.squeeze().cpu().numpy()
 
-                    # Update reconstruction preview
-                    recon_display = (recon_np * 255).astype(np.uint8)
+                    # Update reconstruction preview - clip to valid range
+                    recon_display = np.clip(recon_np * 255, 0, 255).astype(np.uint8)
                     self._update_reconstruction_preview(recon_display)
+
+                    # Update interference plot (throttled to ~10fps with other updates)
+                    self.interference_plot.update_interference(distortion_score_val)
                 else:
                     # Standard model
                     output = self.trained_model(image_tensor)
